@@ -105,7 +105,7 @@ def chart(
 
     # HTML file contents =======================================================
     extra_js = (
-        build_conditional_js(out_dir, marker_file_names) if marker_file_names else ""
+        build_conditional_js(out_dir) if marker_file_names else ""
     )
 
     extra_css = build_conditional_css(out_dir) if marker_file_names else ""
