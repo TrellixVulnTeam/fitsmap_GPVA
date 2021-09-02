@@ -1,5 +1,5 @@
 # MIT License
-# Copyright 2021 Ryan Hausen
+# Copyright 2021 Ryan Hausen and contributors
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of
 # this software and associated documentation files (the "Software"), to deal in
@@ -27,9 +27,10 @@ import os
 import shutil
 import string
 import sys
+from contextlib import contextmanager
 from functools import partial
 from itertools import chain, count, filterfalse, islice, product, repeat
-from multiprocessing import JoinableQueue, Pool, Process
+from multiprocessing import JoinableQueue, Pool, Process, Lock
 from pathlib import Path
 from queue import Empty
 from typing import Any, Callable, Dict, Iterable, List, Tuple
@@ -50,8 +51,6 @@ import fitsmap.cartographer as cartographer
 # https://github.com/zimeon/iiif/issues/11#issuecomment-131129062
 Image.MAX_IMAGE_PIXELS = sys.maxsize
 
-Shape = Tuple[int, int]
-
 IMG_FORMATS = ["fits", "jpg", "png"]
 CAT_FORMAT = ["cat"]
 IMG_ENGINE_PIL = "PIL"
@@ -61,6 +60,12 @@ MPL_CMAP = "gray"
 # MPL SINGLETON ENGINE =========================================================
 mpl_f, mpl_img, mpl_alpha_f, mpl_norm = None, None, None, None
 # ==============================================================================
+
+# LARGEST IMAGE SIZE GLOBAL ====================================================
+lock = Lock()
+image_xy = (0, 0)
+# ==============================================================================
+
 
 MIXED_WHITESPACE_DELIMITER = "mixed_ws"
 
@@ -94,6 +99,14 @@ class ShardedProcBarIter:
     def __next__(self):
         self.proc_bar.update()
         return next(self.iter)
+
+class NonLock:
+    def __init__(self):
+        pass
+    def __enter__(self):
+        pass
+    def __exit__(self, ex_type, ex_value, ex_traceback):
+        return True
 
 
 def build_path(z, y, x, out_dir) -> str:
@@ -382,12 +395,15 @@ def make_tile_mpl(
             cmap.set_bad(color=(0, 0, 0, 0))
 
             img_kwargs = dict(
-                origin="lower", cmap=cmap, interpolation="nearest", norm=mpl_norm
+                origin="lower",
+                cmap=cmap,
+                interpolation="nearest",
+                norm=mpl_norm
             )
 
             mpl_alpha_f = lambda arr: arr
         else:
-            img_kwargs = dict(interpolation="nearest", origin="lower", norm=mpl_norm)
+            img_kwargs = dict(interpolation="nearest", origin="lower")
 
             def adjust_pixels(arr):
                 img = arr.copy()
@@ -467,7 +483,7 @@ def make_tile_pil(
 def tile_img(
     file_location: str,
     pbar_loc: int,
-    tile_size: Shape = [256, 256],
+    tile_size: Tuple[int, int] = [256, 256],
     min_zoom: int = 0,
     image_engine: str = IMG_ENGINE_PIL,
     out_dir: str = ".",
@@ -504,6 +520,9 @@ def tile_img(
         print(f"{fname} already tiled. Skipping tiling.")
         return
 
+    if mp_procs==1:
+        mp_procs = 0
+
     # reset mpl vars just in case they have been set by another img
     global mpl_f
     global mpl_img
@@ -515,7 +534,16 @@ def tile_img(
 
     # get image
     array = get_array(file_location)
-    mpl_norm = simple_norm(array, **norm_kwargs)
+
+    # we need the maximum image size for scaling the points in cartographer.chart
+    global lock
+    with lock:
+        global image_xy
+        new_y, new_x = array.shape[:2]
+        curr_y, curr_x = image_xy
+        image_xy = (max(new_x, curr_x), max(new_y, curr_y))
+
+    mpl_norm = simple_norm(array, invalid=None, **norm_kwargs)
 
     zooms = get_zoom_range(array.shape, tile_size)
     min_zoom = max(min_zoom, zooms[0])
@@ -650,9 +678,10 @@ def line_to_json(
     catalog_img_ext: str,  # Set to None if no images otherwise png/jpg
     catalog_assets_path: str,
     catalog_img_path: str,
+    use_xy: bool,
     src_vals: str,
 ) -> Dict[str, Any]:
-    """Transform a raw text line attribute values into a JSON marker
+    """Transform a raw text line attribute values into a geoJSON marker
 
     Args:
         raw_line (str): String from the marker file
@@ -661,7 +690,8 @@ def line_to_json(
         A list of the column names in order
     """
     src_id = str(src_vals[columns.index("id")])
-    if "x" in columns and "y" in columns:
+
+    if use_xy:
         img_x = float(src_vals[columns.index("x")])
         img_y = float(src_vals[columns.index("y")])
     else:
@@ -768,17 +798,19 @@ def line_to_json(
         f.write(src_desc)
 
     return dict(
-        x=x,
-        y=y,
-        a=a,
-        b=b,
-        theta=theta,
-        catalog_id=src_id,
-        widest_col=longest_str,
-        n_rows=min(rows_per_col, n_src_rows),
-        n_cols=2 * n_cols,
-        include_img=include_img,
-        cat_path=os.path.basename(catalog_assets_path),
+        type= "Feature",
+        geometry = dict(type="Point", coordinates=[x, y]),
+        properties = dict(
+            a=a,
+            b=b,
+            theta=theta,
+            catalog_id=src_id,
+            widest_col=longest_str,
+            n_rows=min(rows_per_col, n_src_rows),
+            n_cols=2 * n_cols,
+            include_img=include_img,
+            cat_path=os.path.basename(catalog_assets_path),
+        ),
     )
 
 
@@ -797,6 +829,7 @@ def catalog_to_markers(
     catalog_delim: str,
     rows_per_col: int,
     n_per_catalog_shard: int,
+    prefer_xy: bool,
     catalog_file: str,
     pbar_loc: int,
 ) -> None:
@@ -811,13 +844,25 @@ def catalog_to_markers(
         None
     """
 
+    sub_dirs = ["css", "js", "json", "catalog_assets"]
+
+    make_dirs = map(
+        lambda sd: os.mkdir(os.path.join(out_dir, sd)),
+        filter(
+            lambda sd: sd not in os.listdir(out_dir),
+            sub_dirs
+        )
+    )
+    for _ in make_dirs:
+        pass
+
     _, fname = os.path.split(catalog_file)
-    out_location = os.path.join(out_dir, "js")
-    check_name = get_marker_file_name(catalog_file).replace(".cat.js", "")
+    out_location = os.path.join(out_dir, "json")
+    check_name = get_marker_file_name(catalog_file).replace(".cat.json", "")
     if os.path.exists(out_location) and any(
         map(lambda fname: fname.startswith(check_name), os.listdir(out_location))
     ):
-        print(f"{fname} already converted to js. Skipping conversion.")
+        print(f"{fname} already converted to json. Skipping conversion.")
         return
 
     if catalog_delim == MIXED_WHITESPACE_DELIMITER:
@@ -830,6 +875,7 @@ def catalog_to_markers(
 
     ra_dec_coords = "ra" in columns and "dec" in columns
     x_y_coords = "x" in columns and "y" in columns
+    use_xy = (not ra_dec_coords) or (prefer_xy)
 
     if (not ra_dec_coords and not x_y_coords) or "id" not in columns:
         err_msg = " ".join(
@@ -840,7 +886,7 @@ def catalog_to_markers(
         )
         raise ValueError(err_msg)
 
-    if ra_dec_coords and (wcs_file is None):
+    if (not use_xy) and (wcs_file is None):
         err_msg = " ".join(
             [catalog_file + " uses ra/dec coords, but a WCS file wasn't", "provided."]
         )
@@ -849,18 +895,8 @@ def catalog_to_markers(
     wcs = WCS(wcs_file) if wcs_file else None
 
     cat_file_root = Path(catalog_file).stem
-    js_safe_file_name = make_fname_js_safe(cat_file_root) + "_cat_var"
-
-    if "js" not in os.listdir(out_dir):
-        os.mkdir(os.path.join(out_dir, "js"))
-
-    if "css" not in os.listdir(out_dir):
-        os.mkdir(os.path.join(out_dir, "css"))
 
     catalog_assets_parent_path = os.path.join(out_dir, "catalog_assets")
-    if "catalog_assets" not in os.listdir(out_dir):
-        os.mkdir(catalog_assets_parent_path)
-
     catalog_assets_path = os.path.join(catalog_assets_parent_path, cat_file_root)
     if cat_file_root not in os.listdir(catalog_assets_parent_path):
         os.mkdir(catalog_assets_path)
@@ -882,6 +918,7 @@ def catalog_to_markers(
         img_ext,
         catalog_assets_path,
         catalog_img_path,
+        use_xy,
     )
 
     bar = tqdm(
@@ -890,7 +927,7 @@ def catalog_to_markers(
         disable=bool(os.getenv("DISBALE_TQDM", False)),
     )
 
-    cat_file = lambda n: cat_file_root + f"_{n}.cat.js"
+    cat_file = lambda n: cat_file_root + f"_{n}.cat.json"
     for shard in count():
         catalog_data = list(
             map(
@@ -900,11 +937,13 @@ def catalog_to_markers(
         )
 
         if len(catalog_data) > 0:
-            json_markers_file = os.path.join(out_dir, "js", cat_file(shard))
+            json_markers_file = os.path.join(out_dir, "json", cat_file(shard))
+            geojson = dict(
+                type="FeatureCollection",
+                features = catalog_data,
+            )
             with open(json_markers_file, "w") as j:
-                j.write("var " + js_safe_file_name + f"_{shard}" + " = ")
-                json.dump(catalog_data, j, indent=2)
-                j.write(";")
+                json.dump(geojson, j, indent=2)
         else:
             break
     f.close()
@@ -944,6 +983,7 @@ def files_to_map(
     image_engine: str = IMG_ENGINE_PIL,
     norm_kwargs: dict = {},
     rows_per_column: int = np.inf,
+    prefer_xy:bool = False,
     n_per_catalog_shard: int = 250000,
 ) -> None:
     """Converts a list of files into a LeafletJS map.
@@ -995,6 +1035,10 @@ def files_to_map(
     if len(files) == 0:
         raise ValueError("No files provided `files` is an empty list")
 
+    # treat 1 and 0 the same way
+    if task_procs==1:
+        task_procs = 0
+
     unlocatable_files = list(filterfalse(os.path.exists, files))
     if len(unlocatable_files) > 0:
         raise FileNotFoundError(unlocatable_files)
@@ -1025,6 +1069,7 @@ def files_to_map(
             catalog_delim,
             rows_per_column,
             n_per_catalog_shard,
+            prefer_xy,
         )
     else:
         cat_job_f = None
@@ -1044,10 +1089,12 @@ def files_to_map(
 
         q.join()
     else:
+        global lock
+        lock = NonLock()
         any(map(lambda func_args: func_args[0](*func_args[1]), tasks))
 
     marker_file_names = sorted(
-        filter(lambda s: ".cat.js" in s, os.listdir(os.path.join(out_dir, "js")))
+        filter(lambda s: ".cat.js" in s, os.listdir(os.path.join(out_dir, "json")))
     )
 
     ns = "\n" * (next(pbar_locations) - 1)
@@ -1058,7 +1105,15 @@ def files_to_map(
     else:
         cat_wcs = None
 
-    cartographer.chart(out_dir, title, map_layer_names, marker_file_names, cat_wcs)
+    global image_xy
+    cartographer.chart(
+        out_dir,
+        title,
+        map_layer_names,
+        marker_file_names,
+        cat_wcs,
+        image_xy
+    )
     print("Done.")
 
 
@@ -1072,11 +1127,12 @@ def dir_to_map(
     procs_per_task: int = 0,
     catalog_delim: str = ",",
     cat_wcs_fits_file: str = None,
-    tile_size: Shape = [256, 256],
+    tile_size: Tuple[int, int] = [256, 256],
     image_engine: str = IMG_ENGINE_PIL,
     norm_kwargs: dict = {},
     rows_per_column: int = np.inf,
     n_per_catalog_shard: int = 250000,
+    prefer_xy:bool = False,
 ) -> None:
     """Converts a list of files into a LeafletJS map.
 
@@ -1161,4 +1217,5 @@ def dir_to_map(
         norm_kwargs=norm_kwargs,
         rows_per_column=rows_per_column,
         n_per_catalog_shard=n_per_catalog_shard,
+        prefer_xy=prefer_xy,
     )

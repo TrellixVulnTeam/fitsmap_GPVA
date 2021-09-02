@@ -1,5 +1,5 @@
 # MIT License
-# Copyright 2021 Ryan Hausen
+# Copyright 2021 Ryan Hausen and contributors
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of
 # this software and associated documentation files (the "Software"), to deal in
@@ -30,7 +30,7 @@ import shutil
 import string
 from itertools import count, repeat
 from functools import partial, reduce
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 from astropy.wcs import WCS
@@ -73,6 +73,7 @@ def chart(
     map_layer_names: List[str],
     marker_file_names: List[str],
     wcs: WCS,
+    img_xy: Tuple[int,int],
 ) -> None:
     """Creates an HTML file containing a leaflet js map using the given params.
 
@@ -82,7 +83,7 @@ def chart(
     ****************************************************************************
     """
     # TODO need to get these numbers
-    img_x, img_y = 123, 123
+    img_x, img_y = img_xy
 
     # convert layer names into a single javascript string
     layer_zooms = lambda l: list(map(int, os.listdir(os.path.join(out_dir, l))))
@@ -204,7 +205,7 @@ def marker_filenames_to_js(marker_file_names: List[str]) -> str:
         return (
             "["
             + ",".join(
-                map(lambda i: f"{name_count[0]}_{i}.cat.json", range(name_count[1]))
+                map(lambda i: f'"../json/{name_count[0]}_{i}.cat.json"', range(name_count[1]))
             )
             + "]"
         )
@@ -291,7 +292,7 @@ def marker_filenames_to_js(marker_file_names: List[str]) -> str:
             "    if (!all_loaded(catalogsLoaded, true)) return;",
             "",
             "    const bounds = map.getBounds();",
-            "    catalog_workers.forEach(worker => {",
+            "    catalogWorkers.forEach(worker => {",
             "        worker.postMessage({",
             "            bbox: [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()],",
             "            zoom: map.getZoom()",
@@ -335,7 +336,7 @@ def build_conditional_css(out_dir: str) -> str:
     return "\n".join(map(lambda s: css_string.format(s), [search_css] + local_css))
 
 
-def build_conditional_js(out_dir: str, marker_file_names: List[str]) -> str:
+def build_conditional_js(out_dir: str) -> str:
 
     support_dir = os.path.join(os.path.dirname(__file__), "support")
     out_js_dir = os.path.join(out_dir, "js")
@@ -363,7 +364,7 @@ def build_conditional_js(out_dir: str, marker_file_names: List[str]) -> str:
 
     js_string = "    <script src='js/{}'></script>"
     local_js = list(
-        map(lambda s: js_string.format(s), marker_file_names + local_js_files)
+        map(lambda s: js_string.format(s), local_js_files)
     )
 
     return "\n".join(leaflet_js + local_js)
@@ -374,7 +375,7 @@ def leaflet_layer_control_declaration(layer_dicts: List[Dict]) -> str:
         list(map(lambda l: '"{0}": {0}'.format(l["name"]), layer_dicts))
     )
 
-    return f"const layerControl = L.control.layers({layer_label_pairs}).addTo(map);"
+    return f"const layerControl = L.control.layers({{ {layer_label_pairs} }}).addTo(map);"
 
 
 def build_worker_js(img_x: int, img_y: int):
@@ -438,7 +439,7 @@ def build_worker_js(img_x: int, img_y: int):
             "    } else {",
             "        fname = fileNames.pop();",
             "        loadData(fname, (data) => {",
-            "            catalogSources.features.push(...data.features);",
+            "            data.features.forEach((d) => catalogSources.features.push(d));",
             "            loadFiles(fileNames, callback);",
             "        });",
             "    }",
@@ -609,7 +610,7 @@ def build_index_js(layer_dicts: List[Dict], marker_file_names: List[str]) -> str
             'map.on("moveend", updateLocationBar);',
             'map.on("zoomend", updateLocationBar);',
             "",
-            'if (urlParam("zoom")==null) {"'
+            'if (urlParam("zoom")==null) {',
             '    map.fitWorld({"maxZoom":map.getMinZoom()});',
             "} else {",
             "    panFromUrl(map);",
