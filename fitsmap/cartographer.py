@@ -210,10 +210,13 @@ def marker_filenames_to_js(marker_file_names: List[str]) -> str:
             + "]"
         )
 
-    def name_to_layer(idx_name):
+    marker_display_mask = "<span class='loading'><img class='loading' src='img/load.gif'></img>{}::Fetching[1/{}}]</span>"
+    def name_to_layer(idx_namecount):
         return '    [L.geoJSON(null, {{pointToLayer: (feat, latlng) => createClusterIcon({}, feat, latlng),}}), "{}"],'.format(
-            *idx_name
+            idx_namecount[0],
+            marker_display_mask.format(*idx_namecount[1])
         )
+
 
     js = "\n".join(
         [
@@ -222,7 +225,7 @@ def marker_filenames_to_js(marker_file_names: List[str]) -> str:
             "];",
             "",
             "const catalogMarkers = [",
-            *list(map(name_to_layer, zip(count(), unique_names))),
+            *list(map(name_to_layer, zip(count(), names_counts))),
             "];",
             "",
             f"const catalogsLoaded = [{','.join(repeat('false', n_catalogs))}];" "",
@@ -231,11 +234,29 @@ def marker_filenames_to_js(marker_file_names: List[str]) -> str:
             "];",
             "",
             "for (let i = 0; i < catalogWorkers.length; i++){",
+            "    layerControl.addOverlay(...catalogMarkers[i]);",
             "    catalogWorkers[i].onmessage = function(e) {",
             "        if (e.data.ready) {",
             "            catalogsLoaded[i] = true;",
-            "            layerControl.addOverlay(...catalogMarkers[i]);",
+            "",
+            "            let catalogText = layerControl._layers[i + nImageLayers].name;",
+            '            catalogText = catalogText.replaceAll(/loading/g, "loading-complete")',
+            '                                     .replace("::Parsing", "");',
+            "            layerControl._layers[i + nImageLayers].name = catalogText;",
+            "            layerControl._update();"
+            "",
             "            update();",
+            "        } else if (e.data.progress){",
+            "            let catalogText = layerControl._layers[i + nImageLayers].name;",
+           r"            let catalogIndex = parseInt(catalogText.match(/(?<=\[)(\d)(?=\/\d\])/)[0]);",
+           r"            let catlogTotal = parseInt(catalogText.match(/(?<=\[\d\/)(\d)(?=\])/)[0]);",
+           r"            catalogText = catalogText.replace(/(?<=\[)(\d)(?=\/\d\])/, (catalogIndex+1).toString()); // added",
+            "            if (catalogIndex+1>catlogTotal){",
+            '                catalogText = catalogText.replace("::Fetching", "::Parsing")',
+           r'                                         .replace(/\[\d\/\d]/, "");',
+            "            }",
+            "            layerControl._layers[i + nImageLayers].name = catalogText;",
+            "            layerControl._update();",
             "        } else if (e.data.expansionZoom){",
             "            map.flyTo(e.data.center, e.data.expansionZoom);",
             "        } else {",
@@ -440,6 +461,7 @@ def build_worker_js(img_x: int, img_y: int):
             "        fname = fileNames.pop();",
             "        loadData(fname, (data) => {",
             "            data.features.forEach((d) => catalogSources.features.push(d));",
+            "            postMessage({progress:1});",
             "            loadFiles(fileNames, callback);",
             "        });",
             "    }",

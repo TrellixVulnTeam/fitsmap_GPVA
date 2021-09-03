@@ -27,7 +27,6 @@ import os
 import shutil
 import string
 import sys
-from contextlib import contextmanager
 from functools import partial
 from itertools import chain, count, filterfalse, islice, product, repeat
 from multiprocessing import JoinableQueue, Pool, Process, Lock
@@ -64,6 +63,14 @@ mpl_f, mpl_img, mpl_alpha_f, mpl_norm = None, None, None, None
 # LARGEST IMAGE SIZE GLOBAL ====================================================
 lock = Lock()
 image_xy = (0, 0)
+class NonLock:
+    """A context manager placeholder n_task_procs<2 for serial runs."""
+    def __init__(self):
+        pass
+    def __enter__(self):
+        pass
+    def __exit__(self, ex_type, ex_value, ex_traceback):
+        return True
 # ==============================================================================
 
 
@@ -99,14 +106,6 @@ class ShardedProcBarIter:
     def __next__(self):
         self.proc_bar.update()
         return next(self.iter)
-
-class NonLock:
-    def __init__(self):
-        pass
-    def __enter__(self):
-        pass
-    def __exit__(self, ex_type, ex_value, ex_traceback):
-        return True
 
 
 def build_path(z, y, x, out_dir) -> str:
