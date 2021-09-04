@@ -1,0 +1,17 @@
+
+img.loading {
+    height: 1em;
+    width: auto;
+    margin-bottom: -0.15em;
+}
+img.loading-complete {
+    display: none;
+}
+
+span.loading {
+    color: darkred;
+}
+
+span.loading-complete {
+    color: black;
+}

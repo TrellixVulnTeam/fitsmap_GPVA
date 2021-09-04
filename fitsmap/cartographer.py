@@ -110,6 +110,8 @@ def chart(
 
     extra_css = build_conditional_css(out_dir) if marker_file_names else ""
 
+    move_supporting_imgs(out_dir)
+
     with open(os.path.join(out_dir, "index.html"), "w") as f:
         f.write(build_html(title, extra_js, extra_css))
     # HTML file contents =======================================================
@@ -192,7 +194,7 @@ def leaflet_map_js(tile_layers: List[dict]):
     return js
 
 
-def marker_filenames_to_js(marker_file_names: List[str]) -> str:
+def marker_filenames_to_js(marker_file_names: List[str], num_image_layers:int) -> str:
 
     deshard_name = lambda s: "_".join(s.replace(".cat.json", "").split("_")[:-1])
     desharded_names = list(map(deshard_name, marker_file_names))
@@ -203,14 +205,14 @@ def marker_filenames_to_js(marker_file_names: List[str]) -> str:
 
     def make_fname_lists(name_count):
         return (
-            "["
+            "    ["
             + ",".join(
                 map(lambda i: f'"../json/{name_count[0]}_{i}.cat.json"', range(name_count[1]))
             )
             + "]"
         )
 
-    marker_display_mask = "<span class='loading'><img class='loading' src='img/load.gif'></img>{}::Fetching[1/{}}]</span>"
+    marker_display_mask = "<span class='loading'><img class='loading' src='img/load.gif'></img>{}::Fetching[1/{}]</span>"
     def name_to_layer(idx_namecount):
         return '    [L.geoJSON(null, {{pointToLayer: (feat, latlng) => createClusterIcon({}, feat, latlng),}}), "{}"],'.format(
             idx_namecount[0],
@@ -233,6 +235,7 @@ def marker_filenames_to_js(marker_file_names: List[str]) -> str:
             *list(repeat('    new Worker("js/worker.js"),', n_catalogs)),
             "];",
             "",
+            f"const nImageLayers = {num_image_layers};",
             "for (let i = 0; i < catalogWorkers.length; i++){",
             "    layerControl.addOverlay(...catalogMarkers[i]);",
             "    catalogWorkers[i].onmessage = function(e) {",
@@ -390,6 +393,28 @@ def build_conditional_js(out_dir: str) -> str:
 
     return "\n".join(leaflet_js + local_js)
 
+
+def move_supporting_imgs(out_dir: str) -> None:
+    support_dir = os.path.join(os.path.dirname(__file__), "support")
+    out_img_dir = os.path.join(out_dir, "img")
+
+    image_exts = [".png", ".jpg", ".gif", ".jpeg"]
+
+    local_image_files = list(
+        filter(lambda f: os.path.splitext(f)[1] in image_exts, os.listdir(support_dir))
+    )
+
+    if not os.path.exists(out_img_dir):
+        os.mkdir(out_img_dir)
+
+    all(
+        map(
+            lambda f: shutil.copy2(
+                os.path.join(support_dir, f), os.path.join(out_img_dir, f)
+            ),
+            local_image_files,
+        )
+    )
 
 def leaflet_layer_control_declaration(layer_dicts: List[Dict]) -> str:
     layer_label_pairs = ",".join(
@@ -626,7 +651,7 @@ def build_index_js(layer_dicts: List[Dict], marker_file_names: List[str]) -> str
             "// catalogs layers =============================================================",
             colors_js(),
             "",
-            marker_filenames_to_js(marker_file_names),
+            marker_filenames_to_js(marker_file_names, len(layer_dicts)),
             "" "",
             'map.on("moveend", update);',
             'map.on("moveend", updateLocationBar);',
