@@ -960,6 +960,7 @@ def files_to_map(
     procs_per_task: int = 0,
     catalog_delim: str = ",",
     cat_wcs_fits_file: str = None,
+    max_catalog_zoom: int = -1,
     tile_size: Tuple[int, int] = [256, 256],
     image_engine: str = IMG_ENGINE_PIL,
     norm_kwargs: dict = {},
@@ -985,6 +986,11 @@ def files_to_map(
         cat_wcs_fits_file (str): A fits file that has the WCS that will be used
                                  to map ra and dec coordinates from the catalog
                                  files to x and y coordinates in the map
+        max_catalog_zoom (int): The zoom level to stop clustering on, the
+                                default is the max zoom level of the image. For
+                                images with a high source density, setting this
+                                higher than the max zoom will help with
+                                performance.
         tile_size (Tuple[int, int]): The tile size for the leaflet map. Currently
                                      only [256, 256] is supported.
         image_engine (str): The method to convert array segments into png images
@@ -1042,7 +1048,10 @@ def files_to_map(
     max_dim = max(utils.peek_image_info(img_files))
     if len(cat_files) > 0:
         # get highlevel image info for catalogging function
-        max_zoom = int(np.log2(2 ** np.ceil(np.log2(max_dim)) / 256))
+        if max_catalog_zoom == -1:
+            max_zoom = int(np.log2(2 ** np.ceil(np.log2(max_dim)) / 256))
+        else:
+            max_zoom = max_catalog_zoom
 
         cat_job_f = partial(
             tile_markers,
@@ -1101,6 +1110,7 @@ def dir_to_map(
     procs_per_task: int = 0,
     catalog_delim: str = ",",
     cat_wcs_fits_file: str = None,
+    max_catalog_zoom: int = -1,
     tile_size: Shape = [256, 256],
     image_engine: str = IMG_ENGINE_PIL,
     norm_kwargs: dict = {},
@@ -1179,6 +1189,7 @@ def dir_to_map(
         procs_per_task=procs_per_task,
         catalog_delim=catalog_delim,
         cat_wcs_fits_file=cat_wcs_fits_file,
+        max_catalog_zoom=max_catalog_zoom,
         tile_size=tile_size,
         image_engine=image_engine,
         norm_kwargs=norm_kwargs,
