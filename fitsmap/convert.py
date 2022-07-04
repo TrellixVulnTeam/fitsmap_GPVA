@@ -43,6 +43,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.visualization import simple_norm
 from imageio import imread
+from joblib import Parallel, delayed, dump, load
 from PIL import Image
 from fitsmap.supercluster import Supercluster
 from tqdm import tqdm
@@ -388,6 +389,301 @@ def make_tile_pil(
     img.thumbnail([256, 256], Image.LANCZOS)
     img.convert("RGBA").save(img_path, "PNG")
     del img
+
+
+def imread_default_tranparent(path: str, size: int = 256) -> np.ndarray:
+    """Opens an image if it exists, if not returns a tranparent image.
+
+    Args:
+        path (str): Image file location
+        size (int, optional): The image size, assumed square. Defaults to 256.
+
+    Returns:
+        np.ndarray: the image if it exists. if not, a transparent image of
+                    size (size, size, 4).
+    """
+    try:
+        arr = imread(path)
+    except FileNotFoundError:
+        arr = np.zeros([size, size, 4], dtype=np.uint8)
+
+    return arr
+
+
+def mem_safe_make_tile_mpl(tile: np.ndarray) -> np.ndarray:
+    """Converts array data into an image using matplotlib
+
+    Args:
+        tile (np.ndarray): The array data
+
+    Returns:
+        np.ndarray: The array data converted into an image using Matplotlib
+    """
+
+    global mpl_f
+    global mpl_img
+    global mpl_alpha_f
+    global mpl_norm
+
+    if mpl_f:
+        # this is a singleton and starts out as null
+        mpl_img.set_data(mpl_alpha_f(tile))  # pylint: disable=not-callable
+    else:
+        if len(tile.shape) == 2:
+            cmap = copy.copy(mpl.cm.get_cmap(MPL_CMAP))
+            cmap.set_bad(color=(0, 0, 0, 0))
+
+            img_kwargs = dict(
+                origin="lower", cmap=cmap, interpolation="nearest", norm=mpl_norm
+            )
+
+            mpl_alpha_f = lambda arr: arr
+        else:
+            img_kwargs = dict(interpolation="nearest", origin="lower", norm=mpl_norm)
+
+            def adjust_pixels(arr):
+                tmp = arr.copy()
+                if tmp.shape[2] == 3:
+                    tmp = np.concatenate(
+                        (
+                            tmp,
+                            np.ones(list(tmp.shape[:-1]) + [1], dtype=np.float32) * 255,
+                        ),
+                        axis=2,
+                    )
+
+                ys, xs = np.where(np.isnan(tmp[:, :, 0]))
+                tmp[ys, xs, :] = np.array([0, 0, 0, 0], dtype=np.float32)
+
+                return tmp.astype(np.uint8)
+
+            mpl_alpha_f = lambda arr: adjust_pixels(arr)
+
+        mpl_f = plt.figure(dpi=256)
+        mpl_f.set_size_inches([256 / 256, 256 / 256])
+        mpl_img = plt.imshow(mpl_alpha_f(tile), **img_kwargs)
+        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+        plt.axis("off")
+
+    # https://stackoverflow.com/a/61756899/2691018
+    img = Image.frombytes(
+        "RGB", mpl_f.canvas.get_width_height(), mpl_f.canvas.tostring_rgb()
+    )
+
+    return img
+
+
+def mem_safe_make_tile_pil(tile: np.ndarray) -> np.ndarray:
+    """Converts the input array into an image using PIL
+
+    Args:
+        tile (np.ndarray): The array data to be converted
+
+    Returns:
+        np.ndarray: an RGBA version of the input data
+    """
+
+    if len(tile.shape) < 3:
+        tile = np.dstack([tile, tile, tile, np.ones_like(tile) * 255])
+    elif tile.shape[2] == 3:
+        tile = np.concatenate(
+            (tile, np.ones(list(tile.shape[:-1]) + [1], dtype=np.float32) * 255),
+            axis=2,
+        )
+    ys, xs = np.where(np.isnan(tile[:, :, 0]))
+    tile[ys, xs, :] = np.array([0, 0, 0, 0], dtype=np.float32)
+    img = Image.fromarray(np.flipud(tile).astype(np.uint8))
+
+    return img
+
+
+def mem_safe_make_tile(
+    out_dir: str,
+    img_engine: str,
+    array: np.ndarray,
+    job: Tuple[int, int, int, slice, slice],
+) -> None:
+    """Extracts a tile from ``array`` and saves it at the proper place in ``out_dir`` using PIL.
+
+    Args:
+        out_dir (str): The directory to save tile in
+        array (np.ndarray): Array to extract a slice from
+        job (Tuple[int, int, int, slice, slice]): A tuple containing z, y, x,
+                                                  dim0_slices, dim1_slices. Where
+                                                  (z, y, x) define the zoom and
+                                                  the coordinates, and (dim0_slices,
+                                                  and dim1_slices) are slice
+                                                  objects that extract the tile.
+
+    Returns:
+        None
+    """
+    z, y, x, slice_ys, slice_xs = job
+    img_path = build_path(z, y, x, out_dir)
+
+    with_out_dir = partial(os.path.join, out_dir)
+
+    if os.path.exists(with_out_dir(f"{z+1}")):
+        top_left = imread_default_tranparent(
+            with_out_dir(f"{z+1}", f"{2*y}", f"{2*x}.png")
+        )
+        top_right = imread_default_tranparent(
+            with_out_dir(f"{z+1}", f"{2*y}", f"{2*x+1}.png")
+        )
+        bottom_left = imread_default_tranparent(
+            with_out_dir(f"{z+1}", f"{2*y+1}", f"{2*x}.png")
+        )
+        bottom_right = imread_default_tranparent(
+            with_out_dir(f"{z+1}", f"{2*y}", f"{2*x+1}.png")
+        )
+
+        tile = np.concatenate(
+            [
+                np.concatenate([top_left, top_right], axis=1),
+                np.concatenate([bottom_left, bottom_right], axis=1),
+            ],
+            axis=0,
+        )
+        img = Image.fromarray(np.flipud(tile).astype(np.uint8))
+    else:
+        tile = array[slice_ys, slice_xs].copy()
+
+        if img_engine == IMG_ENGINE_PIL:
+            img = mem_safe_make_tile_pil(tile)
+        else:
+            img = mem_safe_make_tile_mpl(tile)
+
+    img.thumbnail([256, 256], Image.LANCZOS)
+    img.convert("RGBA").save(img_path, "PNG")
+
+
+def job_lib_tile_img(
+    file_location: str,
+    pbar_loc: int,
+    tile_size: Shape = [256, 256],
+    min_zoom: int = 0,
+    image_engine: str = IMG_ENGINE_MPL,
+    out_dir: str = ".",
+    mp_procs: int = 0,
+    norm_kwargs: dict = {},
+) -> None:
+    global mpl_norm
+
+    _, fname = os.path.split(file_location)
+    if get_map_layer_name(file_location) in os.listdir(out_dir):
+        print(f"{fname} already tiled. Skipping tiling.")
+        return
+
+    tmp_mmap_location = os.path.join(out_dir, f"fitsmap_tmp_mmap_{fname.split('.')[0]}")
+    os.makedirs(tmp_mmap_location, exist_ok=True)
+
+    # get image
+    array = get_array(file_location)
+
+    mpl_norm = simple_norm(array, **norm_kwargs)
+
+    zooms = get_zoom_range(array.shape, tile_size)
+    min_zoom = max(min_zoom, zooms[0])
+    max_zoom = zooms[1]
+
+    # build directory structure
+    name = get_map_layer_name(file_location)
+    tile_dir = os.path.join(out_dir, name)
+    if name not in os.listdir(out_dir):
+        os.mkdir(tile_dir)
+
+    make_dirs(tile_dir, min_zoom, max_zoom)
+
+    total_tiles = get_total_tiles(min_zoom, max_zoom)
+
+    tile_params = chain.from_iterable(
+        [
+            slice_idx_generator(array.shape, z, 256 * (2 ** i))
+            for (i, z) in enumerate(range(max_zoom, min_zoom - 1, -1), start=0)
+        ]
+    )
+
+    jobs = tqdm(
+        tile_params,
+        desc="Converting " + name,
+        position=pbar_loc,
+        total=total_tiles,
+        unit="tile",
+        disable=bool(os.getenv("DISBALE_TQDM", False)),
+    )
+
+    if mp_procs:
+        tmp_mmap_dir = os.path.join(out_dir, f"fitsmap_tmp_mmap_{fname.split('.')[0]}")
+        mmap_file = os.path.join(tmp_mmap_dir, "array.mmap")
+        os.makedirs(tmp_mmap_dir, exist_ok=True)
+
+        dump(array, mmap_file)
+        memmap_array = load(mmap_file, "r")
+        del array
+
+        # make tiles
+        make_tile = partial(mem_safe_make_tile, tile_dir, image_engine, memmap_array)
+
+        # max_nbytes disables auto-dumping the array to tmp for memap
+        Parallel(n_jobs=mp_procs, max_nbytes=None)(
+            delayed(make_tile)(job) for job in jobs
+        )
+
+        # clean up tmp_mmap_data
+        os.remove(mmap_file)
+        os.rmdir(tmp_mmap_dir)
+    else:
+        make_tile = partial(mem_safe_make_tile, tile_dir, image_engine, array)
+        for _ in map(make_tile, jobs):
+            pass
+
+    # reset mpl vars just in case they have been set by another img
+    global mpl_f
+    global mpl_img
+    global mpl_norm
+
+    if mpl_f:
+        mpl_f = None
+        mpl_img = None
+
+    # get image
+    array = get_array(file_location)
+    mpl_norm = simple_norm(array, **norm_kwargs)
+
+    zooms = get_zoom_range(array.shape, tile_size)
+    min_zoom = max(min_zoom, zooms[0])
+    max_zoom = zooms[1]
+
+    # build directory structure
+    name = get_map_layer_name(file_location)
+    tile_dir = os.path.join(out_dir, name)
+    if name not in os.listdir(out_dir):
+        os.mkdir(tile_dir)
+
+    make_dirs(tile_dir, min_zoom, max_zoom)
+
+    tile_params = chain.from_iterable(
+        [
+            slice_idx_generator(array.shape, z, 256 * (2 ** i))
+            for (i, z) in enumerate(range(max_zoom, min_zoom - 1, -1), start=0)
+        ]
+    )
+
+    # tile the image
+    total_tiles = get_total_tiles(min_zoom, max_zoom)
+
+    if image_engine == IMG_ENGINE_MPL:
+        make_tile = partial(make_tile_mpl, tile_dir)
+    else:
+        make_tile = partial(make_tile_pil, tile_dir)
+
+    if mp_procs:
+        pass
+    else:
+        pass
+
+    if image_engine == IMG_ENGINE_MPL:
+        plt.close("all")
 
 
 def tile_img(
